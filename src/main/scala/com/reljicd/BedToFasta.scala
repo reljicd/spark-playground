@@ -1,7 +1,10 @@
 package com.reljicd
 
-import org.apache.spark.sql.SparkSession
+import java.io.File
+
+import com.github.tototoshi.csv._
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.{Dataset, SparkSession}
 
 case class Region(chromosome: String, start: Int, end: Int)
 
@@ -18,32 +21,57 @@ case class RegionFasta(region: Region, fasta: String)
 object BedToFasta {
 
   val referenceCharsPerRow = 50
+  val csvBedFileColumnName = "bed_file_path_selected_sample"
 
   def main(args: Array[String]) {
     if (args.length < 3) {
-      System.err.println("Usage: BedToFasta <bedFile>  <referenceFiles directory>  <outputFile> ")
+      System.err.println("Usage: BedToFasta <csvFile>  <referenceFiles directory>  <outputFile> ")
       System.exit(1)
     }
 
-    val bedFile = args(0)
+    val csvFile = args(0)
     val referenceFilesDir = args(1)
     val outputFile = args(2)
 
     val sparkSession = SparkSession.builder.master("local").appName("Bed to Fasta").getOrCreate()
+
+    bedToFasta(sparkSession, csvFile, referenceFilesDir, outputFile)
+
+    sparkSession.stop()
+  }
+
+  /**
+    *
+    * @param sparkSession
+    * @param csvFile
+    * @param referenceFilesDir
+    * @param outputFile
+    * @return Dataset of RegionFasta
+    */
+  def bedToFasta(sparkSession: SparkSession, csvFile: String, referenceFilesDir: String, outputFile: String): Dataset[RegionFasta] = {
+    val bedFilesList = csvFileToBedFilesList(csvFile)
+    bedToFasta(sparkSession, bedFilesList, referenceFilesDir, outputFile)
+  }
+
+  def bedToFasta(sparkSession: SparkSession, bedFilesList: List[String], referenceFilesDir: String, outputFile: String): Dataset[RegionFasta] = {
     import sparkSession.implicits._
 
     // Map bed file to Region case class
-    val regionsDataSet = sparkSession.read.textFile(bedFile)
-      .map(_.split("\t"))
-      .map(x => Region(chromosome = x(0), start = x(1).toInt, end = x(2).toInt))
+    var regionsDataSet = sparkSession.emptyDataset[Region]
+    for (bedFile <- bedFilesList) {
+      regionsDataSet = regionsDataSet.union(
+        sparkSession.read.textFile(bedFile)
+          .map(_.split("\t"))
+          .map(x => Region(chromosome = x(0), start = x(1).toInt, end = x(2).toInt)))
+    }
 
     // Extract chromosomes from regionsDataSet
     val chromosomes = regionsDataSet.map(x => x.chromosome).distinct().collect()
 
-    var chromosomeNucleobasesRowDataSet = sparkSession.emptyDataset[ChromosomeNucleobasesRow]
 
     // Construct ChromosomeNucleobasesRow dataset from all the .fa files, by iterating through all the extracted chromosomes,
     // and constructing reference files names from .fa files directory name and chromosome names
+    var chromosomeNucleobasesRowDataSet = sparkSession.emptyDataset[ChromosomeNucleobasesRow]
     for (chromosome <- chromosomes) {
       val referenceFile = "%s/%s.fa".format(referenceFilesDir, chromosome)
       chromosomeNucleobasesRowDataSet = chromosomeNucleobasesRowDataSet.union(
@@ -83,7 +111,6 @@ object BedToFasta {
       .map(x => x._2)
       .orderBy("region")
 
-
     // Remove nucleobases not in the region, and return RegionFasta dataset
     val regionFastaDataSet = RegionNucleobasesDataSet
       .map(x => {
@@ -94,6 +121,20 @@ object BedToFasta {
       }
       )
 
-    sparkSession.stop()
+    regionFastaDataSet
   }
+
+  /**
+    * Util for transforming csv file to list of bed files paths
+    *
+    * @param csvFile
+    * @return list of bed files paths
+    */
+  // TODO implement downloading of files from S3
+  def csvFileToBedFilesList(csvFile: String): List[String] = {
+    val reader = CSVReader.open(new File(csvFile))
+    val bedFilesList = reader.allWithHeaders().map(m => m(csvBedFileColumnName))
+    bedFilesList
+  }
+
 }
