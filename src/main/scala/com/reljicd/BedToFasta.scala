@@ -3,9 +3,17 @@ package com.reljicd
 import java.io.File
 import java.nio.file.{Files, Paths}
 
+import com.amazonaws.services.s3.model.AmazonS3Exception
 import com.github.tototoshi.csv._
+import com.reljicd.utils.S3Utils
+import org.apache.commons.io.FileUtils
+import org.apache.commons.io.filefilter.WildcardFileFilter
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.{Dataset, Row, SparkSession}
+
+case class Sample(uuid: String, bedFileLocalPath: String)
+
+case class ChromosomeReference(chromosome: String, referenceFileLocalPath: String)
 
 // monotonicallyIncreasingId field is necessary for sorting output fasta rows as they were in original bed files for the same region
 case class Region(chromosome: String, start: Int, end: Int, bedFile: String, monotonicallyIncreasingId: Int)
@@ -20,52 +28,65 @@ case class RegionNucleobases(region: Region, nucleobases: String)
 
 case class RegionFasta(region: Region, fasta: String)
 
-case class RegionChromosomeFasta(bedFile: String, start: Int, end: Int, chromosome: String, fasta: String)
+case class UUIDFasta(uuid: String, fasta: String)
 
-object BedToFasta {
+object BedToFasta extends S3Utils {
 
   val referenceCharsPerRow = 50
   val csvBedFileColumnName = "bed_file_path_selected_sample"
-  val chromosomeNames: List[String] = for (i <- "Y" :: "X" :: Range(1, 23).toList) yield "chr" + i
+  val defaultCSVOutputDir = "temp/s3/csv"
+  val defaultOutputDir = "temp/output/bed_to_fa"
+  val defaultReferenceFilesDir = "temp/s3/referenceFiles"
+  val defaultBedFilesDir = "temp/s3/bed"
 
   def main(args: Array[String]) {
     if (args.length < 3) {
-      System.err.println("Usage: BedToFasta <csvFile>  <referenceFiles directory>  <outputFile> ")
+      System.err.println("Usage: BedToFasta <csvFile>  <referenceFilesDir>  <outputDir>  <samplesFilter>")
       System.exit(1)
     }
 
-    val csvFile = args(0)
-    val referenceFilesDir = args(1)
-    val outputFile: String = args(2)
+    val csvFile: String = args(0)
+    val referenceFilesDir: String = args(1)
+    val outputDir: String = if (args(2).startsWith("s3")) defaultOutputDir else args(2)
+    val samplesFilter: List[String] = if (args.length > 3) args(3).split(",").toList else List.empty[String]
 
-    // TODO change local cluster in production
-    val sparkSession = SparkSession.builder.master("local").appName("Bed to Fasta").getOrCreate()
+    val sparkSession = SparkSession.builder
+      .master("local") // TODO change local cluster in production
+      .appName("Bed to Fasta")
+      .getOrCreate()
 
-    val bedFilesList = csvFileToBedFilesList(csvFile)
+    val samplesList = csvFileToSamplesList(csvFile, samplesFilter)
 
-    val regionsDS = readRegionsDS(sparkSession, bedFilesList)
+    val bedFilesPathsList = samplesList.map(x => x.bedFileLocalPath)
 
-    val chromosomeNucleobasesRowDS = readChromosomeNucleobasesRowDS(sparkSession, referenceFilesDir)
+    val regionsDS = readRegionsDS(sparkSession, bedFilesPathsList)
+
+    val chromosomeReferencesList = referenceFilesDirToChromosomeReferencesList(referenceFilesDir)
+
+    val chromosomeNucleobasesRowDS = readChromosomeNucleobasesRowDS(sparkSession, chromosomeReferencesList)
 
     val regionFastaDS = calculateRegionFastaDS(sparkSession, regionsDS, chromosomeNucleobasesRowDS)
 
-    writeFastaToOutputFile(sparkSession, regionFastaDS, outputFile)
+    writeFastaToOutputDir(sparkSession, regionFastaDS, samplesList, outputDir)
 
     sparkSession.stop()
+
+    // Write to S3 if <outputDir> is S3 location
+    if (args(2).startsWith("s3")) writeFaFilesToS3(args(2), outputDir, samplesList)
   }
 
   /**
     * Read bed files to Dataset of Region case class
     *
     * @param sparkSession
-    * @param bedFilesList
+    * @param bedFilesPathsList
     * @return
     */
-  def readRegionsDS(sparkSession: SparkSession, bedFilesList: List[String]): Dataset[Region] = {
+  def readRegionsDS(sparkSession: SparkSession, bedFilesPathsList: List[String]): Dataset[Region] = {
     import sparkSession.implicits._
 
     // Map bed file to Region case class
-    sparkSession.read.textFile(bedFilesList: _*)
+    sparkSession.read.textFile(bedFilesPathsList: _*)
       .withColumn("inputFileName", input_file_name())
       .withColumn("monotonicallyIncreasingId", monotonically_increasing_id())
       .map {
@@ -79,27 +100,25 @@ object BedToFasta {
     * Read reference files from referenceFilesDir to Dataset of ChromosomeNucleobasesRow case class
     *
     * @param sparkSession
-    * @param referenceFilesDir
+    * @param chromosomeReferencesList
     * @return
     */
-  def readChromosomeNucleobasesRowDS(sparkSession: SparkSession, referenceFilesDir: String): Dataset[ChromosomeNucleobasesRow] = {
+  def readChromosomeNucleobasesRowDS(sparkSession: SparkSession, chromosomeReferencesList: List[ChromosomeReference]): Dataset[ChromosomeNucleobasesRow] = {
     import sparkSession.implicits._
 
     // Construct ChromosomeNucleobasesRow dataset from all the .fa files, by iterating through all the extracted chromosomes,
     // and constructing reference files names from .fa files directory name and chromosome names
     var chromosomeNucleobasesRowDS = sparkSession.emptyDataset[ChromosomeNucleobasesRow]
-    for (chromosome <- chromosomeNames) {
-      val referenceFile = "%s/%s.fa".format(referenceFilesDir, chromosome)
-      if (Files.exists(Paths.get(referenceFile)))
-        chromosomeNucleobasesRowDS = chromosomeNucleobasesRowDS.union(
-          sparkSession.read.textFile(referenceFile)
-            // Filter out first line of the format ">chr1"
-            .filter(x => !x.contains(">"))
-            .withColumn("row", monotonically_increasing_id)
-            .map {
-              case Row(value: String, row: Long) =>
-                ChromosomeNucleobasesRow(chromosome = chromosome, nucleobases = value.toLowerCase(), row = row.toInt)
-            })
+    for (chromosomeReference <- chromosomeReferencesList) {
+      chromosomeNucleobasesRowDS = chromosomeNucleobasesRowDS.union(
+        sparkSession.read.textFile(chromosomeReference.referenceFileLocalPath)
+          // Filter out first line of the format ">chr1"
+          .filter(x => !x.contains(">"))
+          .withColumn("row", monotonically_increasing_id)
+          .map {
+            case Row(value: String, row: Long) =>
+              ChromosomeNucleobasesRow(chromosome = chromosomeReference.chromosome, nucleobases = value.toLowerCase(), row = row.toInt)
+          })
     }
     chromosomeNucleobasesRowDS
   }
@@ -160,16 +179,60 @@ object BedToFasta {
   }
 
   /**
-    * Util for transforming csv file to list of bed files paths
+    * Util for transforming csv file to list of Samples
+    * Reads CSV file either from S3 or from local path, and than parse it into Samples
     *
-    * @param csvFile
+    * @param csvFilePath
+    * @param samplesFilter
     * @return list of bed files paths
     */
-  // TODO implement downloading of files from S3
-  def csvFileToBedFilesList(csvFile: String): List[String] = {
-    val reader = CSVReader.open(new File(csvFile))
-    val bedFilesList = reader.allWithHeaders().map(m => m(csvBedFileColumnName))
-    bedFilesList
+  def csvFileToSamplesList(csvFilePath: String, samplesFilter: List[String]): List[Sample] = {
+    val csvFile: File = if (csvFilePath.startsWith("s3")) {
+      S3FileToLocalFile(csvFilePath, defaultCSVOutputDir)
+    } else new File(csvFilePath)
+
+    val reader: CSVReader = CSVReader.open(csvFile)
+
+    reader.allWithHeaders()
+      .map(row => Sample(uuid = row("sample_uuid"), bedFileLocalPath = row(csvBedFileColumnName)))
+      // Filter samples by samplesFilter if it is non empty
+      .filter(sample => if (samplesFilter.nonEmpty) samplesFilter.contains(sample.uuid) else true)
+      // Now, if bedFileLocalPath points to S3, download all files from S3 and reassign bedFileLocalPath to local file path
+      .map(sample => {
+      val bedFileLocalPath = if (sample.bedFileLocalPath.startsWith("s3")) {
+        S3FileToLocalFile(sample.bedFileLocalPath, defaultBedFilesDir).getAbsolutePath
+      } else sample.bedFileLocalPath
+      Sample(uuid = sample.uuid, bedFileLocalPath = bedFileLocalPath)
+    })
+  }
+
+  /**
+    * Util for transforming reference files location to list of ChromosomeReferences
+    * Check for the existence of reference files, if they are on S3 downloads them locally, and
+    * returns list ChromosomeReferences
+    *
+    * @param referenceFilesDir
+    * @return list of local reference files paths
+    */
+  def referenceFilesDirToChromosomeReferencesList(referenceFilesDir: String): List[ChromosomeReference] = {
+
+    val chromosomeNames: List[String] = for (i <- "Y" :: "X" :: Range(1, 23).toList) yield "chr" + i
+
+    chromosomeNames
+      .map(chromosome => {
+        var referenceFilePath = s"$referenceFilesDir/$chromosome.fa"
+        if (referenceFilePath.startsWith("s3")) {
+          try {
+            referenceFilePath = S3FileToLocalFile(referenceFilePath, defaultReferenceFilesDir).getAbsolutePath
+          } catch {
+            case ex: AmazonS3Exception =>
+              println(ex)
+          }
+        }
+        ChromosomeReference(chromosome = chromosome, referenceFileLocalPath = referenceFilePath)
+      })
+      .filter(chromosomeReference => Files.exists(Paths.get(chromosomeReference.referenceFileLocalPath)))
+
   }
 
   /**
@@ -177,19 +240,32 @@ object BedToFasta {
     *
     * @param sparkSession
     * @param regionFastaDS
-    * @param outputFile
+    * @param samplesList
+    * @param outputDir
     */
-  def writeFastaToOutputFile(sparkSession: SparkSession, regionFastaDS: Dataset[RegionFasta], outputFile: String): Unit = {
+  def writeFastaToOutputDir(sparkSession: SparkSession, regionFastaDS: Dataset[RegionFasta], samplesList: List[Sample], outputDir: String): Unit = {
 
     import sparkSession.implicits._
 
+    def getUUIDForBedFile(bedFile: String): String = {
+      samplesList.filter(x => bedFile.endsWith(x.bedFileLocalPath)).head.uuid
+    }
+
     regionFastaDS
-      .map(x => RegionChromosomeFasta(x.region.bedFile, x.region.start, x.region.end, x.region.chromosome, x.fasta))
+      .map(x => UUIDFasta(uuid = getUUIDForBedFile(x.region.bedFile), fasta = x.fasta))
       .coalesce(1) // TODO change to some bigger value in prod
       .write
-      .partitionBy("bedFile")
-      .option("header", "true")
-      .csv(outputFile)
+      .partitionBy("uuid")
+      .csv(outputDir)
+  }
+
+  def writeFaFilesToS3(s3OutputLocation: String, localOutputLocation: String, samplesList: List[Sample]): Unit = {
+    for (sample <- samplesList) {
+      val sampleOutputDirectory: File = new File(s"$localOutputLocation/uuid=${sample.uuid}")
+      val sampleFile: File = FileUtils.listFiles(sampleOutputDirectory, new WildcardFileFilter("*.csv"), null).iterator().next()
+      val s3FilePath = s"$s3OutputLocation/${sample.uuid}.fa"
+      uploadFileToS3(sampleFile, s3FilePath)
+    }
   }
 
 }

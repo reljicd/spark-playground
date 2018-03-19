@@ -1,8 +1,9 @@
 package com.reljicd
 
-import com.reljicd.BedToFasta.{calculateRegionFastaDS, readChromosomeNucleobasesRowDS, readRegionsDS}
 import com.holdenkarau.spark.testing.DatasetSuiteBase
+import com.reljicd.BedToFasta.{calculateRegionFastaDS, readChromosomeNucleobasesRowDS, readRegionsDS, referenceFilesDirToChromosomeReferencesList}
 import org.scalatest.FunSuite
+
 
 class BedToFastaTest extends FunSuite with DatasetSuiteBase {
   val bedFile = "src/test/data/BedToFastaTest/bed_file.bed"
@@ -12,7 +13,9 @@ class BedToFastaTest extends FunSuite with DatasetSuiteBase {
   test("integration test") {
     import spark.implicits._
 
-    val chromosomeNucleobasesRowDS = readChromosomeNucleobasesRowDS(spark, referenceFilesDir)
+    val chromosomeReferencesList = referenceFilesDirToChromosomeReferencesList(referenceFilesDir)
+
+    val chromosomeNucleobasesRowDS = readChromosomeNucleobasesRowDS(spark, chromosomeReferencesList)
 
     val regionsDS = readRegionsDS(spark, List(bedFile))
 
